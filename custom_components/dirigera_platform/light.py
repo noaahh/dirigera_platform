@@ -117,6 +117,32 @@ class device_set_model:
         logger.debug(f"Adding {bulb.name} to device_set : {self.name}")
         self._lights.append(bulb)
 
+def turn_on_attributes(kwargs, color_modes, is_on):
+    """The PATCH body for a turn_on, all attributes in one request.
+
+    One entry per attribute: the hub applies every entry of the list, but of
+    several keys in one entry it kept only the first (lightLevel and
+    colorTemperature together set the level and dropped the white). The hub
+    queues every request, so one per lamp instead of one per attribute took
+    three lamps from about 2.5 s to about 1.1 s to settle. isOn is left out
+    when a light that is on gets other changes, which saves it a command.
+    """
+    attributes = []
+    if ATTR_BRIGHTNESS in kwargs:
+        # HA brightness is 0-255, the hub's 1-100. Rounded, so 70 % (178)
+        # stays 70 rather than truncating to 69.
+        attributes.append({"lightLevel": max(1, min(100, round(int(kwargs[ATTR_BRIGHTNESS]) * 100 / 255)))})
+    if ATTR_COLOR_TEMP_KELVIN in kwargs and ColorMode.COLOR_TEMP in color_modes:
+        attributes.append({"colorTemperature": kwargs[ATTR_COLOR_TEMP_KELVIN]})
+    if ATTR_HS_COLOR in kwargs and ColorMode.HS in color_modes:
+        hue, saturation = kwargs[ATTR_HS_COLOR]
+        # One entry, as the lib's set_light_color sends it. Saturation is 0 - 1 at IKEA
+        attributes.append({"colorHue": hue, "colorSaturation": saturation / 100})
+    if not (is_on and attributes):
+        attributes.insert(0, {"isOn": True})
+    return [{"attributes": a} for a in attributes]
+
+
 class ikea_bulb(LightEntity):
     
     def __init__(self, hub, json_data : Light) -> None:
@@ -320,50 +346,25 @@ class ikea_bulb(LightEntity):
         logger.debug(kwargs)
 
         try:
-            # Probably change
             self.reset_ignore_update()
-            await self.hass.async_add_executor_job(self._json_data.set_light,True)
-
-            if ATTR_BRIGHTNESS in kwargs:
-                # brightness requested
-                # The setter will move the HASS value of 0-100 to 1-255
-                self.light_level = int(kwargs[ATTR_BRIGHTNESS])
-                logger.debug("scaled brightness : {}".format(self.light_level))
-                # update
-                await self.hass.async_add_executor_job(self._json_data.set_light_level,self.light_level)
-                self._ignore_update = True 
-
-            if ATTR_COLOR_TEMP_KELVIN in kwargs and ColorMode.COLOR_TEMP in self._supported_color_modes:
-                # color temp requested
-                logger.debug("Request to set color temp...")
-                ct = kwargs[ATTR_COLOR_TEMP_KELVIN]
-                logger.debug("Set CT (Kelvin): {}".format(ct))
-                # Use direct API patch to bypass library validation issues
-                # The hub expects Kelvin values directly
-                await self.hass.async_add_executor_job(
-                    self._hub.patch,
-                    f"/devices/{self._json_data.id}",
-                    [{"attributes": {"colorTemperature": ct}}]
-                )
-                # The direct patch bypasses the lib, so it does not update the
-                # local model (unlike set_light/set_light_color). Without this
-                # write-through, HA kept showing the old color temperature:
-                # the state write below read stale attributes and the hub echo
-                # is suppressed via _ignore_update.
-                self.color_temperature = ct
+            data = turn_on_attributes(kwargs, self._supported_color_modes, self.is_on)
+            await self.hass.async_add_executor_job(self._hub.patch, f"/devices/{self._json_data.id}", data)
+            # The patch bypasses the lib, so write the new values through to
+            # the model: the state write below reads it, and the hub's first
+            # echo, which can carry the old brightness, is skipped.
+            sent = {k: v for entry in data for k, v in entry["attributes"].items()}
+            if "isOn" in sent:
+                self._json_data.attributes.is_on = True
+            if "lightLevel" in sent:
+                self._json_data.attributes.light_level = sent["lightLevel"]
+            if "colorTemperature" in sent:
+                self.color_temperature = sent["colorTemperature"]
                 self._color_mode = ColorMode.COLOR_TEMP
-                self._ignore_update = True
-
-            if ATTR_HS_COLOR in kwargs and ColorMode.HS in self._supported_color_modes:
-                logger.debug("Request to set color HS")
-                hs_tuple = kwargs[ATTR_HS_COLOR]
-                hue = hs_tuple[0]
-                saturation = hs_tuple[1] / 100  # Saturation is 0 - 1 at IKEA
-
-                # set_light_color updates the local model attributes itself
-                await self.hass.async_add_executor_job(self._json_data.set_light_color, hue, saturation)
+            if "colorHue" in sent:
+                self.color_hue = sent["colorHue"]
+                self.color_saturation = sent["colorSaturation"]
                 self._color_mode = ColorMode.HS
-                self._ignore_update = True
+            self._ignore_update = sent.keys() != {"isOn"}
             self.async_schedule_update_ha_state(False)
         except Exception as ex:
             logger.error("error encountered turning on : {}".format(self.name))
@@ -475,8 +476,9 @@ class ikea_bulb_device_set(LightEntity):
             logger.error(ex)
             raise HomeAssistantError(ex, DOMAIN, "hub_exception")
 
-    def patch_command(self, key_val : dict):
-        data = [{"attributes" : key_val}]
+    def patch_command(self, key_val):
+        # A dict of attributes, or a whole PATCH body from turn_on_attributes
+        data = key_val if isinstance(key_val, list) else [{"attributes" : key_val}]
         try:
             self._hub.patch(self._patch_url, data=data)
         except Exception as ex:
@@ -497,37 +499,10 @@ class ikea_bulb_device_set(LightEntity):
             # left the set and its first bulb on their old brightness, white
             # and colour while the hub had applied the new ones.
             self._controller.reset_ignore_update()
-            await self.hass.async_add_executor_job(self.patch_command,{"isOn": True})
-
-            if ATTR_BRIGHTNESS in kwargs:
-                # brightness requested
-                # HASS sends brightness in the range 0-255; the hub expects 1-100
-
-                logger.debug("Request to device_set set brightness...")
-                level = int(kwargs[ATTR_BRIGHTNESS])
-
-                # Clamp to the hub's 1-100 range: HA brightness 1-2 would
-                # otherwise scale to lightLevel 0, which is out of range.
-                scaled = max(1, min(100, round(level * 100 / 255)))
-                logger.debug("Set brightness : {}".format(level))
-                logger.debug("Set scaled brightness : {}".format(scaled))
-                await self.hass.async_add_executor_job(self.patch_command, {"lightLevel" : scaled})
-
-            if ATTR_COLOR_TEMP_KELVIN in kwargs and ColorMode.COLOR_TEMP in self._controller.supported_color_modes:
-                # color temp requested
-                # If request is white then brightness is passed
-                logger.debug("Request to device_set set color temp...")
-                ct = kwargs[ATTR_COLOR_TEMP_KELVIN]
-                logger.debug("Set CT : {}".format(ct))
-                await self.hass.async_add_executor_job(self.patch_command, {"colorTemperature" : ct})
-
-            if ATTR_HS_COLOR in kwargs and ColorMode.HS in self._controller.supported_color_modes:
-                logger.debug("Request to set color HS device_set")
-                hs_tuple = kwargs[ATTR_HS_COLOR]
-                hue = hs_tuple[0]
-                saturation = hs_tuple[1] / 100  # Saturation is 0 - 1 at IKEA
-
-                await self.hass.async_add_executor_job(self.patch_command,{ "colorHue" : hue, "colorSaturation" : saturation})
+            # Always isOn: the set's state is only its first bulb's, and the
+            # others may be off.
+            data = turn_on_attributes(kwargs, self._controller.supported_color_modes, False)
+            await self.hass.async_add_executor_job(self.patch_command, data)
 
         except Exception as ex:
             logger.error("error encountered turning on device_set : {}".format(self.name))
