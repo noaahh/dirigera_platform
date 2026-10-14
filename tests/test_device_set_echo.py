@@ -56,14 +56,16 @@ class _Hass:
 
 def test_turn_on_leaves_the_first_bulbs_echo_alone():
     sent = []
-    checked = []
-    entity = SimpleNamespace(_controller=_Controller(), hass=_Hass(), patch_command=sent.append, _check_bulbs=checked.append)
+
+    async def send(data):
+        sent.append(data)
+
+    entity = SimpleNamespace(_controller=_Controller(), hass=_Hass(), _send=send)
     for kwargs in ({"brightness": 178}, {"color_temp_kelvin": 2700}, {"hs_color": (30, 50)}):
         asyncio.run(_turn_on()[0](entity, **kwargs))
         assert entity._controller._ignore_update is False, kwargs
     # One request per call, always switching the whole set on
     assert len(sent) == 3
-    assert checked == sent  # every set command gets its bulbs checked
     assert sent[0] == [{"attributes": {"isOn": True}}, {"attributes": {"lightLevel": 70}}]
     assert sent[1] == [{"attributes": {"isOn": True}}, {"attributes": {"colorTemperature": 2700}}]
 
@@ -83,42 +85,21 @@ def test_turn_on_attributes():
     assert attrs({"hs_color": (30, 50)}, modes, True) == [{"attributes": {"colorHue": 30, "colorSaturation": 0.5}}]
 
 
-def _lift(*names):
+
+def test_set_sends_one_request_to_each_bulb():
     with open(LIGHT) as fh:
         tree = ast.parse(fh.read())
-    nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names]
     cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "ikea_bulb_device_set")
-    nodes += [n for n in cls.body if isinstance(n, ast.AsyncFunctionDef) and n.name in names]
-    ns = {"SET_CHECK_DELAY": 0, "asyncio": asyncio, "logger": logging.getLogger(__name__)}
-    exec(compile(ast.fix_missing_locations(ast.Module(body=nodes, type_ignores=[])), LIGHT, "exec"), ns)
-    return ns
-
-
-def _bulb(id, on=True, level=70, ct=2702, hue=None, sat=None):
-    attrs = SimpleNamespace(is_on=on, light_level=level, color_temperature=ct, color_hue=hue, color_saturation=sat)
-    return SimpleNamespace(name=id, _json_data=SimpleNamespace(id=id, attributes=attrs))
-
-
-def test_bulb_missed():
-    missed = _lift("bulb_missed")["bulb_missed"]
-    sent = {"isOn": True, "lightLevel": 70, "colorTemperature": 2700}
-    # The hub's mired rounding (2702 for 2700) is not a miss
-    assert not missed(_bulb("a"), sent)
-    assert missed(_bulb("a", level=60), sent)
-    assert missed(_bulb("a", ct=2900), sent)
-    assert missed(_bulb("a", on=False), {"lightLevel": 70, "isOn": True})
-    assert missed(_bulb("a"), {"isOn": False})
-    assert not missed(_bulb("a", hue=30.4, sat=0.5), {"colorHue": 30, "colorSaturation": 0.5})
-
-
-def test_only_bulbs_that_missed_get_the_command_again():
-    ns = _lift("bulb_missed", "_resend_to_missed")
+    fn = next(n for n in cls.body if isinstance(n, ast.AsyncFunctionDef) and n.name == "_send")
+    ns = {"asyncio": asyncio}
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[fn], type_ignores=[])), LIGHT, "exec"), ns)
     patched = []
-    data = [{"attributes": {"lightLevel": 70}}, {"attributes": {"colorTemperature": 2700}}]
+    bulbs = [SimpleNamespace(_json_data=SimpleNamespace(id=i)) for i in ("a", "b")]
     entity = SimpleNamespace(
         hass=_Hass(),
         _hub=SimpleNamespace(patch=lambda url, data: patched.append((url, data))),
-        _device_set=SimpleNamespace(get_lights=lambda: [_bulb("a"), _bulb("b", level=60), _bulb("c")]),
+        _device_set=SimpleNamespace(get_lights=lambda: bulbs),
     )
-    asyncio.run(ns["_resend_to_missed"](entity, data))
-    assert patched == [("/devices/b", data)]
+    data = [{"attributes": {"lightLevel": 70}}]
+    asyncio.run(ns["_send"](entity, data))
+    assert patched == [("/devices/a", data), ("/devices/b", data)]
