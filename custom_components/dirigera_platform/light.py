@@ -119,8 +119,8 @@ class device_set_model:
         self._lights.append(bulb)
 
 # How long after a device set command its bulbs are checked. They report
-# within about 1 s; every command that arrived had arrived by 3 s.
-SET_CHECK_DELAY = 3
+# within about 1 s of a command that arrives.
+SET_CHECK_DELAY = 2
 
 
 def bulb_missed(bulb, sent: dict) -> bool:
@@ -527,13 +527,18 @@ class ikea_bulb_device_set(LightEntity):
     async def _resend_to_missed(self, data):
         await asyncio.sleep(SET_CHECK_DELAY)
         sent = {k: v for entry in data for k, v in entry["attributes"].items()}
-        for bulb in self._device_set.get_lights():
-            if bulb_missed(bulb, sent):
-                logger.debug(f"{bulb.name} missed the device set command, sending it directly")
-                try:
-                    await self.hass.async_add_executor_job(self._hub.patch, f"/devices/{bulb._json_data.id}", data)
-                except Exception as ex:
-                    logger.warning(f"resending to {bulb.name} failed: {ex}")
+        missed = [bulb for bulb in self._device_set.get_lights() if bulb_missed(bulb, sent)]
+
+        async def resend(bulb):
+            logger.debug(f"{bulb.name} missed the device set command, sending it directly")
+            try:
+                await self.hass.async_add_executor_job(self._hub.patch, f"/devices/{bulb._json_data.id}", data)
+            except Exception as ex:
+                logger.warning(f"resending to {bulb.name} failed: {ex}")
+
+        # Together: each request takes the hub about 0.85 s, so in turn the
+        # bulbs of a lost command came on one by one over 2.5 s.
+        await asyncio.gather(*(resend(bulb) for bulb in missed))
 
     # As indicated the turn on / brightness / color etc can be set by a patch command
     # the corresponding get doesnt work 
