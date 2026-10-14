@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from typing import Optional
 
@@ -116,6 +117,30 @@ class device_set_model:
     def add_light(self, bulb):
         logger.debug(f"Adding {bulb.name} to device_set : {self.name}")
         self._lights.append(bulb)
+
+# How long after a device set command its bulbs are checked. They report
+# within about 1 s; every command that arrived had arrived by 3 s.
+SET_CHECK_DELAY = 3
+
+
+def bulb_missed(bulb, sent: dict) -> bool:
+    """Whether a bulb's reported state differs from what was sent to it.
+
+    The hub reports white rounded to mireds (2700 K comes back as 2702) and
+    colour as floats, hence the tolerances.
+    """
+    a = bulb._json_data.attributes
+    if "isOn" in sent and a.is_on != sent["isOn"]:
+        return True
+    if "lightLevel" in sent and abs((a.light_level or 0) - sent["lightLevel"]) > 1:
+        return True
+    if "colorTemperature" in sent and abs((a.color_temperature or 0) - sent["colorTemperature"]) > 30:
+        return True
+    if "colorHue" in sent and (abs((a.color_hue or 0) - sent["colorHue"]) > 2
+                               or abs((a.color_saturation or 0) - sent["colorSaturation"]) > 0.02):
+        return True
+    return False
+
 
 def turn_on_attributes(kwargs, color_modes, is_on):
     """The PATCH body for a turn_on, all attributes in one request.
@@ -397,6 +422,7 @@ class ikea_bulb_device_set(LightEntity):
         self._controller = first_bulb
         self._device_set = device_set
         self._patch_url = f"/devices/set/{device_set.id}?deviceType=light"    
+        self._check = None
 
         # Update cascade entity
         registry_entry_of_bulb = hub_event_listener.get_registry_entry(self._hub.websocket_base_url, first_bulb.unique_id)
@@ -486,6 +512,29 @@ class ikea_bulb_device_set(LightEntity):
             logger.error(ex)
             raise HomeAssistantError(ex, DOMAIN, "hub_exception")
 
+    # A set command reaches its bulbs together, which is the point of a set,
+    # but measured on a set of four the hub lost about one in six: the bulbs
+    # kept their old state, while every command sent to a single bulb
+    # arrived. So once the bulbs should have reported, any that did not
+    # follow get the same body sent to them directly. A newer command
+    # cancels the check, so it never resends an old one.
+    def _check_bulbs(self, data):
+        if self._check is not None:
+            self._check.cancel()
+        self._check = self.hass.async_create_background_task(
+            self._resend_to_missed(data), f"dirigera_platform device set {self._device_set.id} check")
+
+    async def _resend_to_missed(self, data):
+        await asyncio.sleep(SET_CHECK_DELAY)
+        sent = {k: v for entry in data for k, v in entry["attributes"].items()}
+        for bulb in self._device_set.get_lights():
+            if bulb_missed(bulb, sent):
+                logger.debug(f"{bulb.name} missed the device set command, sending it directly")
+                try:
+                    await self.hass.async_add_executor_job(self._hub.patch, f"/devices/{bulb._json_data.id}", data)
+                except Exception as ex:
+                    logger.warning(f"resending to {bulb.name} failed: {ex}")
+
     # As indicated the turn on / brightness / color etc can be set by a patch command
     # the corresponding get doesnt work 
     async def async_turn_on(self, **kwargs):
@@ -503,6 +552,7 @@ class ikea_bulb_device_set(LightEntity):
             # others may be off.
             data = turn_on_attributes(kwargs, self._controller.supported_color_modes, False)
             await self.hass.async_add_executor_job(self.patch_command, data)
+            self._check_bulbs(data)
 
         except Exception as ex:
             logger.error("error encountered turning on device_set : {}".format(self.name))
@@ -514,6 +564,7 @@ class ikea_bulb_device_set(LightEntity):
         logger.debug("light device_set turn_off...")
         try:
             await self.hass.async_add_executor_job(self.patch_command, {"isOn": False})
+            self._check_bulbs([{"attributes": {"isOn": False}}])
         except Exception as ex:
             logger.error("error encountered turning off device_set : {}".format(self.name))
             logger.error(ex)
